@@ -1,0 +1,529 @@
+﻿================================================================================
+                LSB 图像隐写工具 —— 流程代码 + 中文讲解
+================================================================================
+文件位置：D:\LSB_Stego\
+  ├─ lsb_stego.py       命令行核心（嵌入 / 提取）
+  ├─ lsb_stego_gui.py   图形界面（Tkinter）
+  └─ 启动LSB隐写工具.bat 双击静默启动 GUI
+
+用途：教学 / CTF / 学习。只做「把文本藏进图片」和「从图片解码文本」两件事。
+
+【安全边界 · 重要】
+  本工具全程纯本地处理，不联网、不下载、不执行提取出的任何链接。
+  提取到的内容只会显示在窗口里，或另存为 .txt 由你自己分析。
+  （这是刻意的设计约束：隐写原理只涉及嵌入与解码，不涉及拉取远程内容。）
+
+
+================================================================================
+一、整体原理：什么是 LSB 隐写
+================================================================================
+LSB = Least Significant Bit，最低有效位。
+
+一张数字图片由很多像素组成，每个像素有 R、G、B 三个颜色通道，
+每个通道是一个 0~255 的整数（8 个二进制位）。
+
+  例如某通道值 = 173，二进制 = 10101101
+                                    ↑ 最右边这一位就是「最低有效位」
+
+把最低位从 1 改成 0，值变成 172，颜色几乎没变化，人眼完全看不出来。
+于是我们可以：把要隐藏的数据拆成一个个二进制位，
+依次替换掉每个颜色通道的最低位 —— 数据就藏进图片里了。
+
+容量估算：
+  每个像素有 3 个通道 → 每个像素能藏 3 个 bit。
+  一张 128×128 的图 = 16384 像素 × 3 = 49152 bit ≈ 6 KB 数据。
+
+关键限制：
+  只能存无损格式（PNG / BMP / TIFF）。
+  JPEG 是有损压缩，保存时会重算像素值，最低位被抹掉，隐藏数据就毁了。
+
+
+================================================================================
+二、数据格式（怎么知道藏了多少内容）
+================================================================================
+直接把文本位写进去，读取时不知道到哪结束。所以加一个「长度头」：
+
+  [ 32 bit 大端长度 N ][ N 字节 UTF-8 数据 ]
+    └─ 前 4 字节 ─┘   └──── 真正的文本 ────┘
+
+  32 bit = 4 字节，能表示 0 ~ 约 42 亿的长度，足够。
+  「大端」= 高位字节在前（struct 格式符 ">I" 的 > 就是大端）。
+
+提取时：先读前 32 位得到长度 N，再读接下来的 N×8 位，就是完整数据。
+
+
+================================================================================
+三、嵌入流程（embed）分步讲解
+================================================================================
+第 1 步：打开图片，统一成 RGB 模式
+        （有些图是灰度 L、调色板 P、带透明 RGBA，先规范成能逐通道处理的形式）
+
+第 2 步：把要藏的文本编码成 UTF-8 字节
+        data = text.encode("utf-8")
+
+第 3 步：拼装 payload = [4字节长度] + [数据字节]
+        payload = struct.pack(">I", len(data)) + data
+
+第 4 步：把每个字节展开成 8 位二进制，连成一个长的 01 字符串
+        bits = "01001..."（长度 = payload 字节数 × 8）
+
+第 5 步：容量检查
+        如果 bits 长度 > 图片可容纳的位数（宽×高×3），报错，图片太小。
+
+第 6 步：逐像素、逐通道写入最低位
+        对每个通道的旧值：先 & 0xFE 把最低位清零，再 | 目标bit 写进去。
+        (chans[c] & 0xFE) | int(bits[idx])
+          └ 清最低位 ┘     └ 填入新位 ┘
+        写满所有 bit 后停止（done 标志）。
+
+第 7 步：按输出扩展名选择无损格式保存（默认 PNG）
+        out.save(output_path, fmt)
+
+
+================================================================================
+四、提取流程（extract）分步讲解
+================================================================================
+第 1 步：打开图片，统一成 RGB。
+
+第 2 步：做一个「位生成器」bit_gen()
+        按和嵌入时完全相同的顺序（逐行、逐像素、RGB 三通道），
+        依次吐出每个通道的最低位： pixels[x,y][c] & 1
+        顺序一致是提取能成功的前提。
+
+第 3 步：先读 32 位，拼成整数 = 数据长度 N
+        length = int("".join(bits), 2)
+
+第 4 步：合理性校验
+        如果 N=0 或 N 大到超出图片容量，说明这张图没用本工具嵌过数据，报错。
+
+第 5 步：再读 N×8 位，每 8 位还原成一个字节
+        raw.append(int(8位字符串, 2))
+
+第 6 步：把字节按 UTF-8 解码成文本
+        解码失败（不是合法 UTF-8）就用 repr 显示原始字节，方便排查。
+
+第 7 步：返回文本；如果指定了 out_file 就同时写文件。
+        —— 到此为止，绝不联网、绝不执行。
+
+
+================================================================================
+五、命令行用法
+================================================================================
+# 嵌入：把文本/链接藏进无损图片
+python lsb_stego.py embed 原图.png 输出.png "要隐藏的内容"
+
+# 提取：从图片解码出隐藏内容并显示，-o 可另存文件
+python lsb_stego.py extract 输出.png -o 结果.txt
+
+
+================================================================================
+六、图形界面（GUI）结构讲解
+================================================================================
+GUI 用 Python 自带的 tkinter 写的，不依赖额外库。
+它不重复实现算法，而是直接 import 核心文件的 embed / extract 两个函数：
+    from lsb_stego import embed, extract
+所以命令行版和 GUI 版行为完全一致。
+
+界面分三块（从上到下）：
+  1. 选择图片     —— 一个路径输入框 + 「浏览…」按钮（弹文件选择框）
+  2. 内容输入框   —— 多行文本框，填要隐藏的文本/链接
+  3. 结果/日志框  —— 黑底绿字，显示每一步操作结果和提取内容
+
+四个按钮：
+  嵌入并另存为…   校验后调用 embed()，弹保存框选输出位置
+  从图片提取      调用 extract()，结果显示在日志框
+  保存提取结果…   把上次提取的文本另存为 .txt
+  清空            重置输入框和日志
+
+细节：
+  - do_embed 里专门拦截 .jpg/.jpeg，弹错误提示（有损格式会毁数据）。
+  - log() 方法：日志框平时是 disabled（只读），写入前临时改 normal，写完再改回。
+  - 启动用 pythonw.exe（不是 python.exe），所以没有黑色控制台窗口。
+
+
+================================================================================
+七、完整源码（一）lsb_stego.py —— 命令行核心，逐段中文注释
+================================================================================
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LSB 图像隐写工具（教学 / CTF / 学习用途）
+文件顶部三引号里是模块说明：功能、安全约束、数据格式。
+"""
+
+import argparse          # 解析命令行参数（embed / extract 子命令）
+import struct            # 把整数和字节互相转换，用来打包 4 字节长度头
+import sys               # 用到标准输入、标准输出重配编码
+
+from PIL import Image    # Pillow 图像库，负责读写图片、访问像素
+
+
+def _capacity_bits(img):
+    # 计算这张图最多能藏多少个 bit：宽 × 高 × 3（RGB 三通道，每通道 1 bit）
+    return img.size[0] * img.size[1] * 3
+
+
+def embed(image_path, output_path, text):
+    # ============ 嵌入：把 text 藏进 image_path，另存为 output_path ============
+    img = Image.open(image_path)                 # 打开原图
+    if img.mode not in ("RGB", "RGBA"):          # 模式不是 RGB/RGBA（如灰度、调色板）
+        img = img.convert("RGB")                 # 就统一转成 RGB，方便逐通道处理
+
+    data = text.encode("utf-8")                  # 文本 → UTF-8 字节串
+    payload = struct.pack(">I", len(data)) + data
+    # struct.pack(">I", N)：把长度 N 打包成 4 字节「大端」无符号整数
+    # payload = [4字节长度] + [真实数据]，这就是要藏进去的完整内容
+
+    bits = "".join(format(b, "08b") for b in payload)
+    # 把每个字节 format 成 8 位二进制字符串，再全部拼成一个长 01 串
+
+    if len(bits) > _capacity_bits(img):          # 容量检查
+        raise ValueError(
+            "图片太小，装不下这些数据。需要至少 %d 像素，当前 %d 像素。"
+            % (len(bits) // 3 + 1, img.size[0] * img.size[1])
+        )
+
+    out = img.convert("RGB")                     # 生成一张要写入的 RGB 副本
+    pixels = out.load()                          # 拿到像素访问对象（可按坐标读写）
+
+    idx = 0          # 当前写到第几个 bit
+    total = len(bits)  # 一共要写多少 bit
+    done = False       # 是否已写完
+    for y in range(out.size[1]):                 # 从上到下遍历每一行
+        if done:
+            break
+        for x in range(out.size[0]):             # 从左到右遍历每个像素
+            r, g, b = pixels[x, y]               # 取出该像素的三个通道值
+            chans = [r, g, b]                    # 放进列表方便循环修改
+            for c in range(3):                   # 依次处理 R、G、B
+                if idx >= total:                 # 所有 bit 都写完了
+                    done = True
+                    break
+                chans[c] = (chans[c] & 0xFE) | int(bits[idx])
+                # & 0xFE：把该通道最低位清零（0xFE = 11111110）
+                # | int(bit)：把要藏的 bit（0 或 1）填进最低位
+                idx += 1                         # 指向下一个 bit
+            pixels[x, y] = (chans[0], chans[1], chans[2])  # 写回修改后的像素
+            if done:
+                break
+
+    fmt = "PNG"                                  # 默认按 PNG 无损保存
+    if output_path.lower().endswith(".bmp"):     # 根据输出扩展名决定格式
+        fmt = "BMP"
+    elif output_path.lower().endswith((".tif", ".tiff")):
+        fmt = "TIFF"
+    out.save(output_path, fmt)                   # 保存成无损图片
+    return "已嵌入 %d 字节 -> %s\n提示：必须用无损格式保存，JPEG 会破坏隐藏数据。" % (
+        len(data),
+        output_path,
+    )
+
+
+def extract(image_path, out_file=None):
+    # ============ 提取：从 image_path 解码出隐藏文本 ============
+    img = Image.open(image_path)                 # 打开图片
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    img = img.convert("RGB")                     # 统一成 RGB
+    pixels = img.load()                          # 像素访问对象
+
+    bits = []                                    # 暂存读出来的位
+
+    def bit_gen():
+        # 位生成器：按和嵌入时完全相同的顺序，逐个吐出通道最低位
+        for y in range(img.size[1]):
+            for x in range(img.size[0]):
+                for c in range(3):
+                    yield pixels[x, y][c] & 1    # & 1 取出最低位
+
+    gen = bit_gen()                              # 创建生成器
+
+    # 先读 32 bit 长度头
+    for _ in range(32):
+        try:
+            bits.append(str(next(gen)))          # 逐个取位
+        except StopIteration:
+            raise ValueError("图片里没有有效的隐藏数据头（长度字段读不全）。")
+    length = int("".join(bits), 2)               # 32 位二进制 → 整数 = 数据字节数
+
+    if length == 0 or length * 8 > _capacity_bits(img) - 32:
+        # 合理性校验：长度不合理说明这图没用本工具嵌过数据
+        raise ValueError(
+            "解出的长度 %d 不合理，图片可能没有用本工具嵌入过数据。" % length
+        )
+
+    data_bits = []                               # 存放数据部分的位
+    for _ in range(length * 8):                  # 需要 length×8 个位
+        try:
+            data_bits.append(str(next(gen)))
+        except StopIteration:
+            raise ValueError("数据提前结束，图片可能被裁剪或重新压缩过。")
+
+    raw = bytearray()                            # 把位还原成字节
+    for i in range(0, len(data_bits), 8):        # 每 8 位一组
+        raw.append(int("".join(data_bits[i : i + 8]), 2))
+
+    try:
+        text = raw.decode("utf-8")               # 字节 → UTF-8 文本
+    except UnicodeDecodeError:
+        text = repr(bytes(raw))                  # 解码失败就显示原始字节，便于排查
+
+    if out_file:                                 # 如果指定了输出文件
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(text)                        # 写入文件（仅保存，不执行）
+
+    return text
+
+
+def main():
+    # ============ 命令行入口 ============
+    # Windows 控制台默认 GBK，强制 UTF-8 以免中文输出乱码
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        description="LSB 图像隐写工具（教学/CTF）——只嵌入和提取文本，不联网、不执行。"
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)  # 两个子命令
+
+    pe = sub.add_parser("embed", help="把文本隐藏进无损图片")
+    pe.add_argument("image", help="输入图片（PNG/BMP/TIFF）")
+    pe.add_argument("output", help="输出图片（建议 PNG）")
+    pe.add_argument(
+        "text",
+        nargs="?",                               # 可省略；省略则从标准输入读
+        help="要隐藏的文本/URL；省略则从标准输入读取",
+    )
+
+    px = sub.add_parser("extract", help="从图片里解码隐藏文本")
+    px.add_argument("image", help="含隐藏数据的图片")
+    px.add_argument("-o", "--out", help="把提取结果另存到文件")
+
+    args = parser.parse_args()                   # 解析参数
+
+    if args.cmd == "embed":
+        text = args.text if args.text is not None else sys.stdin.read()
+        print(embed(args.image, args.output, text.rstrip("\n")))
+    elif args.cmd == "extract":
+        text = extract(args.image, args.out)
+        print("=== 提取结果 ===")
+        print(text)
+        if args.out:
+            print("\n已保存到：%s" % args.out)
+        print("注意：内容仅作分析用途，本工具不会下载或执行其中任何链接。")
+
+
+if __name__ == "__main__":                       # 直接运行本文件时才执行 main()
+    main()
+
+
+================================================================================
+八、完整源码（二）lsb_stego_gui.py —— 图形界面，逐段中文注释
+================================================================================
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LSB 图像隐写工具 —— 图形界面版（Tkinter）
+"""
+
+import os                                        # 判断文件是否存在
+import tkinter as tk                             # GUI 主库
+from tkinter import filedialog, messagebox, ttk  # 文件框、弹窗、美化控件
+
+from lsb_stego import embed, extract             # 直接复用核心算法，不重复实现
+
+
+class App:
+    def __init__(self, root):
+        # ============ 搭建整个窗口 ============
+        self.root = root
+        root.title("LSB 图像隐写工具（教学/CTF）")  # 窗口标题
+        root.geometry("720x560")                  # 初始大小
+        root.minsize(640, 480)                    # 最小大小
+
+        self.image_path = tk.StringVar()          # 绑定图片路径的变量
+
+        pad = {"padx": 8, "pady": 6}              # 统一的外边距
+
+        # ---- 第 1 块：图片选择 ----
+        top = ttk.LabelFrame(root, text="1. 选择图片（PNG / BMP / TIFF，无损格式）")
+        top.pack(fill="x", **pad)                 # 横向填满
+        ttk.Entry(top, textvariable=self.image_path).pack(
+            side="left", fill="x", expand=True, padx=6, pady=6
+        )                                          # 路径输入框
+        ttk.Button(top, text="浏览…", command=self.pick_image).pack(
+            side="left", padx=6, pady=6
+        )                                          # 浏览按钮，点了弹文件选择框
+
+        # ---- 第 2 块：内容输入 ----
+        mid = ttk.LabelFrame(root, text="2. 要隐藏的文本 / 链接（嵌入时用）")
+        mid.pack(fill="both", expand=False, **pad)
+        self.input_text = tk.Text(mid, height=4, wrap="word")  # 多行文本框
+        self.input_text.pack(fill="x", padx=6, pady=6)
+
+        # ---- 按钮行 ----
+        btns = ttk.Frame(root)
+        btns.pack(fill="x", **pad)
+        ttk.Button(btns, text="嵌入并另存为…", command=self.do_embed).pack(
+            side="left", padx=6
+        )
+        ttk.Button(btns, text="从图片提取", command=self.do_extract).pack(
+            side="left", padx=6
+        )
+        ttk.Button(btns, text="保存提取结果…", command=self.do_save).pack(
+            side="left", padx=6
+        )
+        ttk.Button(btns, text="清空", command=self.do_clear).pack(side="left", padx=6)
+
+        # ---- 第 3 块：结果 / 日志 ----
+        out = ttk.LabelFrame(root, text="3. 结果 / 日志")
+        out.pack(fill="both", expand=True, **pad)  # 占满剩余空间
+        self.output = tk.Text(out, wrap="word", state="disabled", bg="#111", fg="#0f0")
+        # state=disabled：只读；bg 黑、fg 绿：终端风格
+        self.output.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        sb = ttk.Scrollbar(out, command=self.output.yview)  # 滚动条
+        sb.pack(side="right", fill="y")
+        self.output.config(yscrollcommand=sb.set)
+
+        self.log("提示：本工具只做嵌入与提取，全程不联网、不下载、不执行任何链接。")
+
+    # ---------- 辅助方法 ----------
+    def log(self, msg):
+        # 往日志框追加一行；日志框平时只读，写前临时解锁
+        self.output.config(state="normal")
+        self.output.insert("end", msg + "\n")
+        self.output.see("end")                    # 自动滚到最新一行
+        self.output.config(state="disabled")
+
+    def pick_image(self):
+        # 弹出文件选择框，选中后把路径填进输入框
+        path = filedialog.askopenfilename(
+            title="选择图片",
+            filetypes=[
+                ("无损图片", "*.png *.bmp *.tif *.tiff"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if path:
+            self.image_path.set(path)
+            self.log("已选择：%s" % path)
+
+    def do_embed(self):
+        # ============ 点「嵌入并另存为」时执行 ============
+        src = self.image_path.get().strip()       # 取输入的图片路径
+        if not src or not os.path.isfile(src):     # 校验：图片必须存在
+            messagebox.showwarning("缺少图片", "请先选择一张要嵌入的图片。")
+            return
+        text = self.input_text.get("1.0", "end").rstrip("\n")  # 取要隐藏的文本
+        if not text:                               # 校验：内容不能为空
+            messagebox.showwarning("内容为空", "请在第 2 步输入要隐藏的文本/链接。")
+            return
+        if src.lower().endswith((".jpg", ".jpeg")):  # 拦截 JPEG（有损会毁数据）
+            messagebox.showerror(
+                "格式不支持", "JPEG 是有损格式，会破坏 LSB 数据。请改用 PNG/BMP/TIFF。"
+            )
+            return
+
+        out = filedialog.asksaveasfilename(       # 弹保存框，选输出位置
+            title="另存为",
+            defaultextension=".png",
+            initialfile="隐藏后.png",
+            filetypes=[("PNG", "*.png"), ("BMP", "*.bmp"), ("TIFF", "*.tif *.tiff")],
+        )
+        if not out:                                # 用户取消了
+            return
+        try:
+            msg = embed(src, out, text)            # 调用核心 embed
+            self.log("\n[嵌入完成]\n" + msg)
+            messagebox.showinfo("完成", "嵌入成功！\n" + out)
+        except Exception as e:                     # 出错弹窗 + 记日志
+            self.log("\n[嵌入失败] %s" % e)
+            messagebox.showerror("嵌入失败", str(e))
+
+    def do_extract(self):
+        # ============ 点「从图片提取」时执行 ============
+        src = self.image_path.get().strip()
+        if not src or not os.path.isfile(src):
+            messagebox.showwarning("缺少图片", "请先选择一张含隐藏数据的图片。")
+            return
+        try:
+            text = extract(src)                    # 调用核心 extract
+            self.log("\n[提取结果]\n" + text)       # 结果显示在日志框（仅显示）
+            self.output.config(state="normal")
+            self.output.insert("end", "\n")
+            self.output.config(state="disabled")
+            self._last_extract = text              # 缓存，供「保存提取结果」用
+        except Exception as e:
+            self._last_extract = None
+            self.log("\n[提取失败] %s" % e)
+            messagebox.showerror("提取失败", str(e))
+
+    def do_save(self):
+        # ============ 点「保存提取结果」时执行 ============
+        text = getattr(self, "_last_extract", None)  # 取上次提取的文本
+        if not text:
+            messagebox.showwarning("无内容", "还没有可保存的提取结果，请先点「从图片提取」。")
+            return
+        out = filedialog.asksaveasfilename(          # 选保存位置
+            title="保存提取结果",
+            defaultextension=".txt",
+            initialfile="提取结果.txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not out:
+            return
+        with open(out, "w", encoding="utf-8") as f:  # 写成 txt（仅保存，不执行）
+            f.write(text)
+        self.log("\n已保存到：%s" % out)
+        messagebox.showinfo("完成", "已保存：\n" + out)
+
+    def do_clear(self):
+        # ============ 点「清空」时执行：重置输入框和日志 ============
+        self.input_text.delete("1.0", "end")
+        self.output.config(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.config(state="disabled")
+        self._last_extract = None
+
+
+def main():
+    # ============ 程序入口：创建窗口并进入事件循环 ============
+    root = tk.Tk()                                 # 创建主窗口
+    try:
+        ttk.Style().theme_use("vista")             # Windows 上用 vista 主题更美观
+    except tk.TclError:
+        pass
+    App(root)                                      # 构建界面
+    root.mainloop()                                # 进入事件循环，等待用户操作
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+九、启动脚本 启动LSB隐写工具.bat 说明
+================================================================================
+内容（纯 ASCII，避免 cmd 按 GBK 解码导致乱码）：
+
+    @echo off
+    cd /d "%~dp0"
+    start "" "C:\Program Files\python\pythonw.exe" "%~dp0lsb_stego_gui.py"
+    exit
+
+逐行含义：
+  @echo off            不回显命令本身，窗口更干净
+  cd /d "%~dp0"        切换到 bat 文件自己所在的目录（%~dp0 = 本 bat 的盘符+路径）
+                       这样整个文件夹挪到哪都能用
+  start "" "pythonw..." "脚本路径"
+                       用 pythonw.exe（无控制台版本）静默启动 GUI，不弹黑框
+                       start 让它独立运行，bat 窗口随即关闭
+  exit                 结束 bat
+
+================================================================================
+                              —— 文档结束 ——
+================================================================================
